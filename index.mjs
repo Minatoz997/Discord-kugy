@@ -16,6 +16,8 @@ const client = new Client({
   partials: [Partials.Channel],
 });
 
+const queue = new Map();
+
 // ✅ MongoDB setup
 mongoose.connect(process.env.MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true })
   .then(() => console.log("✅ Connected to MongoDB"))
@@ -71,6 +73,9 @@ client.on("messageCreate", async (message) => {
 - !radio ➔ Play lofi radio
 - !radioindo ➔ Play radio Indonesia
 - !play <url_youtube> ➔ Play audio dari YouTube
+- !skip ➔ Skip lagu
+- !stop ➔ Stop lagu
+- !queue ➔ Tampilkan antrian lagu
 - !help ➔ Menampilkan command list`);
   }
 
@@ -170,6 +175,8 @@ client.on("messageCreate", async (message) => {
 
   // 🔥 Play YouTube Audio
   if (message.content.startsWith("!play ")) {
+    const serverQueue = queue.get(message.guild.id);
+
     if (!message.member.voice.channel) {
       return message.reply("❌ Kamu harus join voice channel dulu.");
     }
@@ -180,36 +187,116 @@ client.on("messageCreate", async (message) => {
       return message.reply("❌ URL YouTube tidak valid.");
     }
 
-    try {
-      const stream = await play.stream(url);
-      const connection = joinVoiceChannel({
-        channelId: message.member.voice.channel.id,
-        guildId: message.guild.id,
-        adapterCreator: message.guild.voiceAdapterCreator,
-      });
+    const songInfo = await play.search(url, { limit: 1 });
+    const song = {
+      title: songInfo[0].title,
+      url: songInfo[0].url,
+      duration: songInfo[0].duration,
+    };
 
-      const player = createAudioPlayer();
-      const resource = createAudioResource(stream.stream, {
-        inputType: stream.type,
-      });
+    if (!serverQueue) {
+      const queueContruct = {
+        textChannel: message.channel,
+        voiceChannel: message.member.voice.channel,
+        connection: null,
+        songs: [],
+        volume: 5,
+        playing: true,
+      };
 
-      player.play(resource);
-      connection.subscribe(player);
+      queue.set(message.guild.id, queueContruct);
+      queueContruct.songs.push(song);
 
-      player.on(AudioPlayerStatus.Playing, () => {
-        console.log(`🎶 Playing YouTube: ${url}`);
-        message.reply("✅ Memutar audio dari YouTube sekarang!");
-      });
-
-      player.on("error", (error) => {
-        console.error(error);
-        message.reply("❌ Gagal memutar audio YouTube.");
-      });
-    } catch (error) {
-      console.error(error);
-      message.reply("❌ Terjadi kesalahan saat memutar YouTube.");
+      try {
+        const connection = joinVoiceChannel({
+          channelId: message.member.voice.channel.id,
+          guildId: message.guild.id,
+          adapterCreator: message.guild.voiceAdapterCreator,
+        });
+        queueContruct.connection = connection;
+        playSong(message.guild.id, queueContruct.songs[0]);
+      } catch (err) {
+        console.log(err);
+        queue.delete(message.guild.id);
+        return message.channel.send(err);
+      }
+    } else {
+      serverQueue.songs.push(song);
+      return message.channel.send(`✅ **${song.title}** ditambahkan ke antrian!`);
     }
+  } else if (message.content.startsWith("!skip")) {
+    skip(message);
+    return;
+  } else if (message.content.startsWith("!stop")) {
+    stop(message);
+    return;
+  } else if (message.content.startsWith("!queue")) {
+    displayQueue(message);
+    return;
   }
 });
+
+function playSong(guildId, song) {
+  const serverQueue = queue.get(guildId);
+  if (!song) {
+    serverQueue.voiceChannel.leave();
+    queue.delete(guildId);
+    return;
+  }
+
+  const player = createAudioPlayer();
+  play.stream(song.url).then(stream => {
+    const resource = createAudioResource(stream.stream, {
+      inputType: stream.type,
+    });
+    player.play(resource);
+    serverQueue.connection.subscribe(player);
+
+    player.on(AudioPlayerStatus.Idle, () => {
+      serverQueue.songs.shift();
+      playSong(guildId, serverQueue.songs[0]);
+    });
+
+    player.on("error", error => {
+      console.error(error);
+    });
+
+    serverQueue.textChannel.send(`🎶 Memutar: **${song.title}** - Durasi: ${song.duration}`);
+  })
+}
+
+function skip(message) {
+  const serverQueue = queue.get(message.guild.id);
+  if (!message.member.voice.channel)
+    return message.channel.send(
+      "❌ Kamu harus join voice channel dulu untuk skip lagu!"
+    );
+  if (!serverQueue)
+    return message.channel.send("❌ Tidak ada lagu yang bisa di-skip!");
+
+  const player = serverQueue.connection.state.subscription.player;
+  player.stop();
+}
+
+function stop(message) {
+  const serverQueue = queue.get(message.guild.id);
+  if (!message.member.voice.channel)
+    return message.channel.send(
+      "❌ Kamu harus join voice channel dulu untuk stop lagu!"
+    );
+  serverQueue.songs = [];
+  const player = serverQueue.connection.state.subscription.player;
+  player.stop();
+}
+
+function displayQueue(message) {
+  const serverQueue = queue.get(message.guild.id);
+  if (!serverQueue) return message.channel.send("❌ Antrian kosong!");
+  let queueMessage = "📜 **Antrian Lagu:**\n";
+  serverQueue.songs.forEach((song, index) => {
+    queueMessage += `${index + 1}. ${song.title}\n`;
+  });
+  return message.channel.send(queueMessage);
+}
 
 client.login(process.env.DISCORD_TOKEN);
